@@ -30,6 +30,7 @@
 #include "account.h"
 #include "accountstate.h"
 #include "account.h"
+#include "accountmanager.h"
 #include "capabilities.h"
 #include "common/asserts.h"
 #include "guiutility.h"
@@ -49,7 +50,7 @@
 #include <QStringBuilder>
 #include <QMessageBox>
 #include <QFileDialog>
-
+#include <QRegularExpression>
 
 #include <QAction>
 #include <QJsonDocument>
@@ -60,6 +61,7 @@
 
 #include <QProcess>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 
 #ifdef Q_OS_MAC
 #include <CoreFoundation/CoreFoundation.h>
@@ -72,6 +74,18 @@
 #define MIRALL_SOCKET_API_VERSION "1.1"
 
 namespace {
+
+const QLatin1Char RecordSeparator()
+{
+    return QLatin1Char('\x1e');
+}
+
+QStringList split(const QString &data)
+{
+    // TODO: string ref?
+    return data.split(RecordSeparator());
+}
+
 #if GUI_TESTING
 
 using namespace OCC;
@@ -329,7 +343,7 @@ void SocketApi::slotSocketDestroyed(QObject *obj)
 void SocketApi::slotReadSocket()
 {
     QIODevice *socket = qobject_cast<QIODevice *>(sender());
-    OC_ASSERT(socket);
+    OC_ENFORCE(socket);
 
     // Find the SocketListener
     //
@@ -347,26 +361,18 @@ void SocketApi::slotReadSocket()
     while (socket->canReadLine()) {
         // Make sure to normalize the input from the socket to
         // make sure that the path will match, especially on OS X.
-        QString line = QString::fromUtf8(socket->readLine()).normalized(QString::NormalizationForm_C);
-        line.chop(1); // remove the '\n'
+        const QString line = QString::fromUtf8(socket->readLine().trimmed()).normalized(QString::NormalizationForm_C);
         qCInfo(lcSocketApi) << "Received SocketAPI message <--" << line << "from" << socket;
-        QByteArray command = line.split(":").value(0).toLatin1();
+        const QByteArray command = line.mid(0, line.indexOf(QLatin1Char(':'))).toUtf8();
+        const QByteArray functionWithArguments = "command_" + command + (command.startsWith("ASYNC_") ? "(QSharedPointer<SocketApiJob>)" : "(QString,SocketListener*)");
+        const int indexOfMethod = staticMetaObject.indexOfMethod(functionWithArguments);
 
-        QByteArray functionWithArguments = "command_" + command;
-        if (command.startsWith("ASYNC_")) {
-            functionWithArguments += "(QSharedPointer<SocketApiJob>)";
-        } else {
-            functionWithArguments += "(QString,SocketListener*)";
-        }
-
-        int indexOfMethod = staticMetaObject.indexOfMethod(functionWithArguments);
-
-        QString argument = line.remove(0, command.length() + 1);
+        const auto argument = line.midRef(command.length() + 1);
         if (command.startsWith("ASYNC_")) {
 
             auto arguments = argument.split('|');
             if (arguments.size() != 2) {
-                listener->sendMessage(QLatin1String("argument count is wrong"));
+                listener->sendMessage(QStringLiteral("argument count is wrong"));
                 return;
             }
 
@@ -375,7 +381,7 @@ void SocketApi::slotReadSocket()
             auto jobId = arguments[0];
 
             auto socketApiJob = QSharedPointer<SocketApiJob>(
-                new SocketApiJob(jobId, listener, json), &QObject::deleteLater);
+                new SocketApiJob(jobId.toString(), listener, json), &QObject::deleteLater);
             if (indexOfMethod != -1) {
                 staticMetaObject.method(indexOfMethod)
                     .invoke(this, Qt::QueuedConnection,
@@ -383,15 +389,15 @@ void SocketApi::slotReadSocket()
             } else {
                 qCWarning(lcSocketApi) << "The command is not supported by this version of the client:" << command
                       << "with argument:" << argument;
-                socketApiJob->reject("command not found");
+                socketApiJob->reject(QStringLiteral("command not found"));
             }
         } else {
             if (indexOfMethod != -1) {
                 // to ensure that listener is still valid we need to call it with Qt::DirectConnection
                 OC_ASSERT(thread() == QThread::currentThread())
                 staticMetaObject.method(indexOfMethod)
-                    .invoke(this, Qt::DirectConnection, Q_ARG(QString, argument),
-                            Q_ARG(SocketListener *, listener));
+                    .invoke(this, Qt::DirectConnection, Q_ARG(QString, argument.toString()),
+                        Q_ARG(SocketListener *, listener));
             } else {
                 qCWarning(lcSocketApi) << "The command is not supported by this version of the client:" << command << "with argument:" << argument;
             }
@@ -721,7 +727,7 @@ void SocketApi::copyUrlToClipboard(const QString &link)
 
 void SocketApi::command_MAKE_AVAILABLE_LOCALLY(const QString &filesArg, SocketListener *)
 {
-    QStringList files = filesArg.split(QLatin1Char('\x1e')); // Record Separator
+    const QStringList files = split(filesArg);
 
     for (const auto &file : files) {
         auto data = FileData::get(file);
@@ -740,7 +746,7 @@ void SocketApi::command_MAKE_AVAILABLE_LOCALLY(const QString &filesArg, SocketLi
 /* Go over all the files and replace them by a virtual file */
 void SocketApi::command_MAKE_ONLINE_ONLY(const QString &filesArg, SocketListener *)
 {
-    QStringList files = filesArg.split(QLatin1Char('\x1e')); // Record Separator
+    const QStringList files = split(filesArg);
 
     for (const auto &file : files) {
         auto data = FileData::get(file);
@@ -816,6 +822,79 @@ void SocketApi::command_MOVE_ITEM(const QString &localFile, SocketListener *)
             nullptr, tr("Error"),
             tr("Moving file failed:\n\n%1").arg(error));
     }
+}
+
+void SocketApi::command_LIST_ACCOUNTS(const QString &, SocketListener *listener) const
+{
+    // oCDC -> VSSC: ACCOUNTS:account_id:user@cloud,account_id:user@cloud2,...
+    QStringList parts;
+    for (auto acc : AccountManager::instance()->accounts()) {
+        // TODO: Use uuid once https://github.com/owncloud/client/pull/8397 is merged
+        parts.append(acc->account()->id() + QLatin1Char(':') + acc->account()->displayName());
+    }
+    const QString message = QStringLiteral("ACCOUNTS:") + parts.join(RecordSeparator());
+    listener->sendMessage(message);
+}
+
+void SocketApi::command_UPLOAD_FILE(const QString &argument, SocketListener *listener) const
+{
+    const auto args = split(argument);
+    qDebug() << args;
+    OC_ASSERT(args.size() == 4);
+    const auto localFolder = args[0].endsWith("/") ? args[0] : args[0] + QLatin1Char('/');
+    const auto &pattern = args[1];
+    const auto &remotePath = args[2];
+    // TODO: use uuid
+    const auto accname = args[3].split(":")[1];
+    auto acc = AccountManager::instance()->account(accname);
+
+    OC_ENFORCE(QFileInfo(localFolder).isAbsolute());
+
+
+    struct Scope
+    {
+        Scope(AccountPtr acc, const QString &localDir, const QString &pattern, const QString &remoteDir)
+        {
+            OC_ENFORCE(tmp.open());
+
+            db = new SyncJournalDb(tmp.fileName());
+            engine = new SyncEngine(acc, localDir, remoteDir, db);
+            auto opt = engine->syncOptions();
+            opt.setFilePattern(pattern);
+            qDebug() << opt.fileRegex()->pattern();
+            qDebug() << opt.fileRegex()->errorString();
+
+            OC_ENFORCE(opt.fileRegex()->isValid());
+            engine->setSyncOptions(opt);
+
+            connect(engine, &SyncEngine::itemCompleted, engine, [this](const SyncFileItemPtr item) {
+                syncedFiles.append(item->_file);
+            });
+        }
+        ~Scope()
+        {
+            engine->deleteLater();
+            db->deleteLater();
+        }
+        QTemporaryFile tmp;
+        SyncJournalDb *db;
+        SyncEngine *engine;
+        QStringList syncedFiles;
+    };
+    auto a = new Scope(acc->account(), localFolder, pattern, remotePath);
+    connect(a->engine, &SyncEngine::finished, this, [a, localFolder, listener](bool ok) {
+        if (listener) {
+            listener->sendMessage("UPLOAD_FILE_RESULT:" + localFolder + RecordSeparator() + a->syncedFiles.join(";") + RecordSeparator() + (ok ? "ok" : "error"));
+        }
+        delete a;
+    });
+    connect(a->engine, &SyncEngine::syncError, this, [a, localFolder, listener](const QString &msg) {
+        if (listener) {
+            listener->sendMessage("UPLOAD_FILE_RESULT:" + localFolder + RecordSeparator() + a->syncedFiles.join(";") + RecordSeparator() + msg);
+        }
+        delete a;
+    });
+    a->engine->startSync();
 }
 
 void SocketApi::emailPrivateLink(const QString &link)
@@ -942,7 +1021,7 @@ SocketApi::FileData SocketApi::FileData::parentFolder() const
 void SocketApi::command_GET_MENU_ITEMS(const QString &argument, OCC::SocketListener *listener)
 {
     listener->sendMessage(QString("GET_MENU_ITEMS:BEGIN"));
-    QStringList files = argument.split(QLatin1Char('\x1e')); // Record Separator
+    const QStringList files = split(argument);
 
     // Find the common sync folder.
     // syncFolder will be null if files are in different folders.

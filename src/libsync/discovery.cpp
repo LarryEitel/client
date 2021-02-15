@@ -65,8 +65,6 @@ void ProcessDirectoryJob::process()
 {
     OC_ASSERT(_localQueryDone && _serverQueryDone);
 
-    QString localDir;
-
     // Build lookup tables for local, remote and db entries.
     // For suffix-virtual files, the key will normally be the base file name
     // without the suffix.
@@ -161,6 +159,15 @@ void ProcessDirectoryJob::process()
             }
         }
 
+        const auto &regex = _discoveryData->_syncOptions.fileRegex();
+        if (regex) {
+            if (!e.localEntry.isDirectory && !regex->match(path._target).hasMatch()) {
+                qCWarning(lcDisco) << "FilePattern: ignoring" << path._target;
+                continue;
+            } else {
+                qCWarning(lcDisco) << "FilePattern: taking" << path._target;
+            }
+        }
         // If the filename starts with a . we consider it a hidden file
         // For windows, the hidden state is also discovered within the vio
         // local stat function.

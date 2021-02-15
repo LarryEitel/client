@@ -13,6 +13,7 @@
  */
 
 #include "syncoptions.h"
+#include <QRegularExpression>
 
 using namespace OCC;
 
@@ -52,4 +53,19 @@ void SyncOptions::verifyChunkSizes()
 {
     _minChunkSize = qMin(_minChunkSize, _initialChunkSize);
     _maxChunkSize = qMax(_maxChunkSize, _initialChunkSize);
+}
+
+const QSharedPointer<QRegularExpression> &SyncOptions::fileRegex() const
+{
+    return _fileRegex;
+}
+
+void SyncOptions::setFilePattern(const QString &pattern)
+{
+    _fileRegex.reset(new QRegularExpression(QStringLiteral("(^|/|\\\\)") + pattern + QLatin1Char('$')));
+}
+
+void SyncOptions::setPathPattern(const QString &pattern)
+{
+    _fileRegex.reset(new QRegularExpression(QLatin1Char('^') + pattern + QLatin1Char('$')));
 }
